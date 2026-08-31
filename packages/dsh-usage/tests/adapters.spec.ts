@@ -1,12 +1,24 @@
 import { describe, expect, it } from 'vitest'
-import { adapterFor, providerErrorMessage, PROVIDER_ADAPTERS } from '../src/core/adapters.ts'
+import { adapterFor, isDeepSeekProviderRoute, providerErrorMessage, PROVIDER_ADAPTERS } from '../src/core/adapters.ts'
 
 describe('adapterFor', () => {
   it('serves every documented route id', () => {
-    for (const id of ['deepseek', 'moonshotai-cn', 'moonshotai', 'kimi-coding', 'zai-coding-cn', 'zai-coding', 'opencode-go', 'minimax-cn', 'minimax', 'openrouter', 'siliconflow', 'siliconflow-intl', 'zenmux']) {
+    for (const id of ['deepseek', 'deepseek-official', 'moonshotai-cn', 'moonshotai', 'kimi-coding', 'zai-coding-cn', 'zai-coding', 'opencode-go', 'minimax-cn', 'minimax', 'openai-codex', 'openrouter', 'siliconflow', 'siliconflow-intl', 'zenmux']) {
       expect(adapterFor(id), id).toBeDefined()
     }
     expect(adapterFor('unknown-provider')).toBeUndefined()
+  })
+
+  it('serves the official DeepSeek live route and the catalog alias with one adapter', () => {
+    // `deepseek-official` is the llm-deepseek route sessions carry; `deepseek`
+    // is the configurable-catalog key. The announce fallback keys on family
+    // identity, so both ids must land on the same adapter object.
+    expect(adapterFor('deepseek-official')).toBe(adapterFor('deepseek'))
+    expect(isDeepSeekProviderRoute('deepseek-official')).toBe(true)
+    expect(isDeepSeekProviderRoute('deepseek')).toBe(true)
+    expect(isDeepSeekProviderRoute('kimi-coding')).toBe(false)
+    expect(isDeepSeekProviderRoute('zenmux')).toBe(false)
+    expect(isDeepSeekProviderRoute('unknown-provider')).toBe(false)
   })
 
   it('keeps route ids unique across adapters', () => {
@@ -53,6 +65,20 @@ describe('kimi coding plan parse', () => {
     expect(parsed?.planName).toBe('LEVEL_8')
     expect(parsed?.windows).toContainEqual({ key: '5h', name: '5h limit', percent: 2, resetsAt: '2026-08-29T12:00:00.000Z' })
     expect(parsed?.windows).toContainEqual({ key: 'week', name: 'Weekly', percent: 45, resetsAt: '2026-08-31T00:00:00.000Z' })
+  })
+
+  it('normalizes reset instants or drops them (never passes raw text through)', () => {
+    const parse = (resetTime: unknown) =>
+      adapter.plan?.parse(200, { limits: [{ window: { duration: 60, timeUnit: 'TIME_UNIT_MINUTE' }, detail: { used: 1, limit: 2, resetTime } }] })
+        ?.windows[0]?.resetsAt
+    // Epoch instants as strings normalize through the numeric branch.
+    expect(parse('1756428000')).toBe(new Date(1756428000 * 1000).toISOString())
+    expect(parse('1756428000000')).toBe(new Date(1756428000000).toISOString())
+    // Unparseable text resolves to undefined, not "Invalid Date" fodder.
+    expect(parse('2026-13-45')).toBeUndefined()
+    expect(parse('soon')).toBeUndefined()
+    expect(parse('')).toBeUndefined()
+    expect(parse(null)).toBeUndefined()
   })
 })
 
@@ -125,6 +151,41 @@ describe('minimax plan parse', () => {
       model_remains: [{ model_name: 'general', current_interval_remaining_percent: 5, current_weekly_status: 3 }],
     })
     expect(noWeekly?.windows).toHaveLength(1)
+  })
+})
+
+describe('openai-codex plan parse', () => {
+  const adapter = adapterFor('openai-codex')!
+  it('builds the wham/usage probe with the oauth bearer and account header', () => {
+    expect(adapter.plan?.build({ apiKey: 'tok', accountId: 'acc-1' })).toEqual({
+      url: 'https://chatgpt.com/backend-api/wham/usage',
+      headers: {
+        authorization: 'Bearer tok',
+        'user-agent': 'codex-cli',
+        accept: 'application/json',
+        'chatgpt-account-id': 'acc-1',
+      },
+    })
+  })
+
+  it('parses the primary/secondary windows onto the shared key vocabulary', () => {
+    const parsed = adapter.plan?.parse(200, {
+      rate_limit: {
+        primary_window: { used_percent: 42.5, limit_window_seconds: 18000, reset_at: 1788000000 },
+        secondary_window: { used_percent: 7, limit_window_seconds: 604800, reset_at: 1788300000 },
+      },
+    })
+    expect(parsed?.windows).toEqual([
+      { key: '5h', percent: 42.5, resetsAt: '2026-08-29T10:40:00.000Z' },
+      { key: 'week', percent: 7, resetsAt: '2026-09-01T22:00:00.000Z' },
+    ])
+    const freePlan = adapter.plan?.parse(200, {
+      rate_limit: { primary_window: { used_percent: 90, limit_window_seconds: 2_592_000, reset_at: 1789000000 } },
+    })
+    expect(freePlan?.windows[0]?.key).toBe('month')
+    // Missing used_percent drops the window; a rate_limit-less body is rejected.
+    expect(adapter.plan?.parse(200, { rate_limit: { primary_window: {} } })).toBeUndefined()
+    expect(adapter.plan?.parse(200, {})).toBeUndefined()
   })
 })
 

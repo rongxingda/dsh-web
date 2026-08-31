@@ -1,10 +1,11 @@
 /**
- * Mobile remote control — browser half. Registers the `remote` dictionaries,
- * the sidebar-foot entry (phone trigger + pairing panel) into the
- * ui-sidebar-declared `sidebar.remote` seat, and runs the phone-side boot
- * flow (pair accept + workspace deep-link + presence heartbeats) plus the
- * one-time failed-pair notice. Export discipline: packages/client/AGENTS.md
- * — the /client surface carries only what cordis loading needs plus types.
+ * Remote control — browser half. Registers the `remote` dictionaries, the
+ * sidebar-foot entry (phone trigger + pairing panel + update trigger), and
+ * the pair boot flow (accept + presence heartbeats) plus the one-time
+ * failed-pair notice. The portrait-touch adaptation of the official UI
+ * starts at module scope (startMobileAdapt) so its focus guard is installed
+ * before the app boots. Export discipline: packages/client/AGENTS.md — the
+ * /client surface carries only what cordis loading needs plus types.
  */
 import { createElement } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -37,6 +38,13 @@ import {
 } from './remote-channel.ts'
 import { FenceNotice } from './FenceNotice.tsx'
 import { reportDailyHeartbeat } from './telemetry.ts'
+import { startMobileAdapt, type RemoteAdaptGlobal } from './mobile-adapt.ts'
+
+// Portrait-touch adaptation of the official UI: installed at module scope so
+// the composer focus guard exists before any app entry mounts React. The
+// layer self-evaluates and reverts with the viewport; the plugin apply below
+// wires its toggleSidebar onto the official layout service.
+startMobileAdapt()
 
 export type { RemoteEntryProps } from './RemoteEntry.tsx'
 export type { PanelState, RemotePanelProps } from './RemotePanel.tsx'
@@ -121,7 +129,48 @@ export function apply(ctx: ClientContext): void {
     }
   }, 'remote-web-ui: dictionaries')
 
+  // The mobile adapt's whale button expands the collapsed sidebar and the
+  // activation closes the details panel — both through the official layout
+  // service (ctx.layout.toggleSidebar / closeDetails flip the panel state;
+  // the narrow-viewport semantics open the drawer).
+  const layout = ctx.get('layout') as { toggleSidebar?: () => void; closeDetails?: () => void } | undefined
+  const adapt = (window as unknown as { __dshRemoteAdapt?: RemoteAdaptGlobal }).__dshRemoteAdapt
+  // The official layout face throws (by contract) when the root entry has
+  // not mounted yet; these closures also fire from gestures racing that
+  // first mount, so they tolerate the throw instead of surfacing it.
+  const layoutCall = (call: (() => void) | undefined): void => {
+    try {
+      call?.()
+    } catch {
+      // Boot-order throw: the panel action is a no-op before the root entry.
+    }
+  }
+  if (layout !== undefined && adapt !== undefined) {
+    if (typeof layout.toggleSidebar === 'function') {
+      adapt.toggleSidebar = () => {
+        layoutCall(layout.toggleSidebar)
+      }
+    }
+    if (typeof layout.closeDetails === 'function') {
+      adapt.closeDetails = () => {
+        layoutCall(layout.closeDetails)
+      }
+    }
+  }
+  if (adapt !== undefined && adapt.toggleSidebar === null) {
+    // Layout face unavailable (older composition): fall back to clicking the
+    // official rail toggle when it exists.
+    adapt.toggleSidebar = () => {
+      (document.querySelector('[class$="_railFish"] button, [class$="_logoRow"] [class*="_iconButton"]') as HTMLElement | null)?.click()
+    }
+  }
+
   const t = ctx.locale.bind(NS)
+  // Hand the `remote` translate seat to the module-scope adaptation layer:
+  // the whale/compact-picker labels were rendered with the English fallback
+  // before any dictionary existed; the wiring plus the layer's own sync tick
+  // re-render them in the active locale.
+  if (adapt !== undefined) adapt.translate = t
   const binder = ctx.get('webUiSettings') ?? ctx.settingsScope
   const settingsScope = binder.bind<RemoteSettings>({ namespace: REMOTE_WEB_UI_NS })
   const enabled = (): boolean => {
@@ -131,29 +180,35 @@ export function apply(ctx: ClientContext): void {
       : snapshot.status === 'unavailable'
   }
 
-  // Sidebar foot entry: the shell declares 'sidebar.remote' in unconstrained
-  // order, so registration is declaration-aware — slots.inject waits on the
-  // declaration, removes the contribution when it collapses, and re-runs
-  // The sidebar foot seat is `sidebar.footer.action` in the 0.1.2 shell
-  // composition (the legacy `sidebar.remote` seat is gone upstream). The
-  // deep-link workspace source is the head row of the workspaces projection
-  // (host order), read through the injected controller. The service lookup
-  // stays lazy: `workspaces` may register after apply() runs (deep-link.ts
-  // polls for it), so a source captured once here would stay undefined for
-  // the page lifetime.
-  const getTargetWorkspaceId = (): string | undefined => {
-    const workspacesSource = ctx.get('workspaces') as {
-      list: { getSnapshot(): { items: ReadonlyArray<{ workspaceId: unknown }> } }
-    } | undefined
-    const head = workspacesSource?.list.getSnapshot().items[0]
-    return head === undefined ? undefined : String(head.workspaceId)
+  // Master switch for the adaptation layer: the module-scope install runs
+  // before any config is readable, so flip it once the settings snapshot is
+  // bound and on every later change (disabled plugin = no injected surface).
+  // Also replay the pending closeDetails: the first portrait apply ran
+  // before the layout face was wired, so its closeDetails was a no-op and a
+  // restored details panel would otherwise sit hidden until landscape.
+  const syncAdaptEnabled = (): void => {
+    ;(window as unknown as { __dshRemoteAdapt?: RemoteAdaptGlobal }).__dshRemoteAdapt?.setEnabled?.(enabled())
   }
+  settingsScope.subscribe(syncAdaptEnabled)
+  syncAdaptEnabled()
+  // The replay closes a details panel restored before the wiring; the
+  // layout face throws while the root entry has not mounted yet (a real
+  // boot-order race on slow remote loads), and the plugin's apply world
+  // must survive it — the replay is a best-effort no-op then.
+  try {
+    adapt?.flushCloseDetails?.()
+  } catch {}
+
+  // Sidebar foot entry: the sidebar foot seat is `sidebar.footer.action` in
+  // the 0.1.2 shell composition (the legacy `sidebar.remote` seat is gone
+  // upstream). The pairing link is origin-agnostic, so the entry needs no
+  // workspace source.
   ctx.slots.inject('sidebar.footer.action', () => {
     let disposeEntry: (() => void) | undefined
     const syncEntry = (): void => {
       if (enabled() && disposeEntry === undefined) {
         try {
-          disposeEntry = ctx.slots.register({ name: 'sidebar.footer.action', id: 'remote-web-ui', locale: NS, inject: () => ({ getTargetWorkspaceId }) }, FooterRemoteEntry)
+          disposeEntry = ctx.slots.register({ name: 'sidebar.footer.action', id: 'remote-web-ui', locale: NS }, FooterRemoteEntry)
         } catch {
           // ignore registration collision
         }

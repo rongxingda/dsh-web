@@ -20,11 +20,18 @@ export interface UsageTokenTotals {
   reasoningTokens: number
   /** Provider calls that reported usage. */
   calls: number
+  /**
+   * Spend estimate stamped at fold time, in the priced provider's billing
+   * currency (currently DeepSeek official only, CNY); every other provider
+   * stays 0 = unpriced, so the sum is never a mixed-currency total. Persisted
+   * buckets recorded before a price-book change keep the old pricing.
+   */
+  cost: number
 }
 
 /** A zeroed totals bucket. */
 export function emptyTotals(): UsageTokenTotals {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, calls: 0 }
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, calls: 0, cost: 0 }
 }
 
 /** Add `right` into `left` in place. */
@@ -35,6 +42,7 @@ export function addTotals(left: UsageTokenTotals, right: Readonly<UsageTokenTota
   left.cacheWriteTokens += right.cacheWriteTokens
   left.reasoningTokens += right.reasoningTokens
   left.calls += right.calls
+  left.cost += right.cost
   return left
 }
 
@@ -99,8 +107,12 @@ export interface ProviderSnapshotView {
   /** Display name from the LLM runtime, else the adapter's, else the route key. */
   displayName: string
   credential: CredentialKind
-  /** Whether a balance/plan adapter exists for this route. */
+  /** Whether any balance/plan adapter exists for this route. */
   supported: boolean
+  /** A balance adapter exists for this route (the Usage tab's balance card). */
+  balanceSupported?: boolean
+  /** A coding-plan adapter exists for this route — the Plans tab lists these only. */
+  planSupported?: boolean
   balance?: BalanceView
   plan?: PlanView
   /** Last probe failure, cleared on the next success. */
@@ -123,5 +135,28 @@ export interface UsageOverviewView {
     today: { date: string; totals: UsageTokenTotals; providers: UsageProviderSummary[] }
     /** Last N local days ascending, including today. */
     days: UsageDaySummary[]
+    /**
+     * The same window aggregated per provider and model — the trend card's
+     * bar-chart data. Optional so an older host document still renders.
+     */
+    range?: {
+      from: string
+      to: string
+      totals: UsageTokenTotals
+      providers: UsageProviderSummary[]
+    }
   }
+}
+
+/**
+ * Host-side snapshot state: the wire view plus one error slot per probed
+ * fact. A probe half only clears its own slot, so a plan success can no
+ * longer mask a failing balance probe (and vice versa); the overview
+ * collapses them into the single wire `error` line, balance first.
+ */
+export interface ProviderSnapshotState extends ProviderSnapshotView {
+  /** Last balance-probe failure; cleared on the next balance success. */
+  balanceError?: string
+  /** Last plan-probe failure; cleared on the next plan success. */
+  planError?: string
 }

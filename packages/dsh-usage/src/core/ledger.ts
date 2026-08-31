@@ -5,7 +5,7 @@
  * @module @linxin666/dsh-usage/core/ledger
  */
 
-import { addTotals, emptyTotals, type UsageLedgerDocument, type UsageTokenTotals } from './types.ts'
+import { addTotals, emptyTotals, type UsageLedgerDocument, type UsageProviderSummary, type UsageTokenTotals } from './types.ts'
 
 /** Local-date key (`YYYY-MM-DD`) for an epoch ms timestamp. */
 export function localDateKey(ms: number): string {
@@ -21,8 +21,19 @@ export function createLedgerDocument(): UsageLedgerDocument {
 }
 
 /**
+ * Bucket keys come from untrusted directions (persisted JSON, provider and
+ * model ids out of session events), so they must never collide with
+ * `Object.prototype` plumbing: assigning `day['__proto__']` or reading
+ * `day['constructor']` would pollute every object in the host process.
+ */
+function isSafeBucketKey(key: string): boolean {
+  return key !== '__proto__' && key !== 'constructor' && key !== 'prototype'
+}
+
+/**
  * Fold one usage report into the ledger in place. `provider` is the route key
- * and `model` the provider-owned model id the step ran under.
+ * and `model` the provider-owned model id the step ran under. Reports keyed
+ * by prototype-plumbing names are dropped.
  */
 export function foldUsage(
   doc: UsageLedgerDocument,
@@ -31,6 +42,7 @@ export function foldUsage(
   model: string,
   usage: Readonly<UsageTokenTotals>,
 ): void {
+  if (!isSafeBucketKey(provider) || !isSafeBucketKey(model)) return
   if (usage.calls <= 0 && usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens <= 0) return
   const dayKey = localDateKey(atMs)
   const day = doc.days[dayKey] ?? {}
@@ -45,6 +57,50 @@ export function foldUsage(
 /** Total tokens of a bucket (billed input + output; reasoning is inside output). */
 export function totalTokens(totals: Readonly<UsageTokenTotals>): number {
   return totals.inputTokens + totals.cacheReadTokens + totals.cacheWriteTokens + totals.outputTokens
+}
+
+/** How many model rows one summarized provider keeps. */
+export const SUMMARY_MODEL_CAP = 12
+
+/**
+ * Aggregate whole per-day maps (each `provider -> model -> totals`) into the
+ * per-provider/per-model summary the overview serves for one day or a range:
+ * disjoint bucket sums per provider, per-model rows heaviest first, and the
+ * grand total. Pure: reads its inputs, allocates fresh buckets.
+ */
+export function summarizeDays(days: ReadonlyArray<Record<string, Record<string, UsageTokenTotals>>>): {
+  totals: UsageTokenTotals
+  providers: UsageProviderSummary[]
+} {
+  const merged = new Map<string, Map<string, UsageTokenTotals>>()
+  for (const day of days) {
+    for (const [provider, models] of Object.entries(day)) {
+      if (!isSafeBucketKey(provider) || typeof models !== 'object' || models === null) continue
+      let modelMap = merged.get(provider)
+      if (modelMap === undefined) {
+        modelMap = new Map()
+        merged.set(provider, modelMap)
+      }
+      for (const [model, totals] of Object.entries(models)) {
+        if (typeof totals !== 'object' || totals === null) continue
+        const bucket = modelMap.get(model) ?? emptyTotals()
+        addTotals(bucket, totals)
+        modelMap.set(model, bucket)
+      }
+    }
+  }
+  const providers: UsageProviderSummary[] = []
+  const totals = emptyTotals()
+  for (const [provider, modelMap] of merged) {
+    const providerTotals = emptyTotals()
+    const modelRows = [...modelMap].map(([model, modelTotals]) => ({ model, totals: modelTotals }))
+    for (const row of modelRows) addTotals(providerTotals, row.totals)
+    modelRows.sort((a, b) => totalTokens(b.totals) - totalTokens(a.totals))
+    providers.push({ provider, totals: providerTotals, models: modelRows.slice(0, SUMMARY_MODEL_CAP) })
+  }
+  providers.sort((a, b) => totalTokens(b.totals) - totalTokens(a.totals))
+  for (const row of providers) addTotals(totals, row.totals)
+  return { totals, providers }
 }
 
 /** All local-date keys in the ledger, ascending. */
@@ -81,6 +137,7 @@ function reviveTotals(value: unknown): UsageTokenTotals | undefined {
     cacheWriteTokens: num('cacheWriteTokens'),
     reasoningTokens: num('reasoningTokens'),
     calls: num('calls'),
+    cost: num('cost'),
   }
 }
 
@@ -96,11 +153,16 @@ export function deserializeLedger(value: unknown): UsageLedgerDocument {
   if (typeof days !== 'object' || days === null) return doc
   for (const [dateKey, providers] of Object.entries(days as Record<string, unknown>)) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey) || typeof providers !== 'object' || providers === null) continue
+    // Round-trip the date key: an impossible date (9999-99-99) parses to NaN
+    // and a rollover (2026-02-30) lands on another day; both would otherwise
+    // fold into a bogus, never-pruned bucket.
+    const atMs = new Date(dateKey + 'T12:00:00').getTime()
+    if (!Number.isFinite(atMs) || localDateKey(atMs) !== dateKey) continue
     for (const [provider, models] of Object.entries(providers as Record<string, unknown>)) {
       if (typeof models !== 'object' || models === null) continue
       for (const [model, totals] of Object.entries(models as Record<string, unknown>)) {
         const revived = reviveTotals(totals)
-        if (revived !== undefined) foldUsage(doc, new Date(dateKey + 'T12:00:00').getTime(), provider, model, revived)
+        if (revived !== undefined) foldUsage(doc, atMs, provider, model, revived)
       }
     }
   }
